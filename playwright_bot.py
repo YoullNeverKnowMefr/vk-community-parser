@@ -1,4 +1,4 @@
-"""Работа с VK через Playwright: вход, чтение стены, публикация в канал."""
+"""Работа с VK через Playwright: ручной вход, чтение стены, публикация в канал."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from urllib.parse import urlparse
 import requests
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
-LOGIN_URL = "https://id.vk.com/auth"
 VK_HOME_URL = "https://vk.com/feed"
+VK_LOGIN_PAGE = "https://id.vk.com/auth"
 
 
 @dataclass
@@ -116,17 +116,44 @@ class VkPlaywrightBot:
 
         return page.locator('button:has-text("Войти")').count() == 0
 
-    def _type_into_first(self, selectors: list[str], value: str) -> bool:
+    def wait_for_manual_login(self) -> None:
+        if self.is_logged_in():
+            logging.info("Сессия VK активна")
+            self.save_session()
+            return
+
+        if self.headless:
+            raise RuntimeError(
+                "Сессия VK не найдена. Сначала выполните вход вручную:\n"
+                "  python main.py --login-only\n"
+                "(без --headless, в открытом браузере)"
+            )
+
         page = self.page
-        for selector in selectors:
-            field = page.locator(selector).first
-            if field.count() == 0 or not field.is_visible():
-                continue
-            field.click()
-            field.fill("")
-            field.type(value, delay=35)
-            return True
-        return False
+        logging.info("Откройте VK и войдите вручную в браузере")
+        page.goto(VK_LOGIN_PAGE, wait_until="domcontentloaded", timeout=60_000)
+
+        print(
+            "\n=== Вход в VK ===\n"
+            "1. Войдите в аккаунт в открывшемся браузере (логин, пароль, SMS).\n"
+            "2. Дождитесь загрузки ленты vk.com.\n"
+            "3. Нажмите Enter в этой консоли.\n"
+        )
+        input("Нажмите Enter после входа в VK... ")
+
+        if not self.is_logged_in():
+            raise RuntimeError(
+                "Вход не подтверждён. Убедитесь, что вы авторизованы в VK в браузере"
+            )
+
+        logging.info("Ручной вход выполнен, сессия сохранена")
+        self.save_session()
+
+    def ensure_logged_in(self) -> None:
+        if not self.is_logged_in():
+            self.wait_for_manual_login()
+        else:
+            logging.info("Сессия VK активна")
 
     def _click_first(self, selectors: list[str]) -> bool:
         page = self.page
@@ -137,105 +164,6 @@ class VkPlaywrightBot:
             button.click()
             return True
         return False
-
-    def _wait_for_sms_code(self) -> str:
-        logging.info("Требуется код из SMS. Введите его в консоль и нажмите Enter.")
-        code = input("Код SMS: ").strip()
-        if not code:
-            raise RuntimeError("Код SMS не введён")
-        return code
-
-    def _handle_sms_if_needed(self) -> None:
-        page = self.page
-        sms_selectors = [
-            'input[name="otp"]',
-            'input[inputmode="numeric"]',
-            'input[type="tel"]',
-            'input[autocomplete="one-time-code"]',
-        ]
-        for selector in sms_selectors:
-            field = page.locator(selector).first
-            if field.count() == 0 or not field.is_visible():
-                continue
-            code = self._wait_for_sms_code()
-            field.click()
-            field.fill("")
-            field.type(code, delay=60)
-            self._click_first([
-                'button[type="submit"]',
-                'button:has-text("Продолжить")',
-                'button:has-text("Подтвердить")',
-            ])
-            page.wait_for_load_state("domcontentloaded", timeout=60_000)
-            time.sleep(2)
-            return
-
-    def login(self, phone: str, password: str) -> None:
-        if self.is_logged_in():
-            logging.info("Уже авторизованы в VK")
-            self.save_session()
-            return
-
-        page = self.page
-        logging.info("Открываю страницу входа VK ID...")
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
-        time.sleep(2)
-
-        if not self._type_into_first(
-            [
-                'input[name="login"]',
-                'input[type="tel"]',
-                'input[autocomplete="username"]',
-                'input[placeholder*="телефон" i]',
-                'input[placeholder*="phone" i]',
-            ],
-            phone,
-        ):
-            raise RuntimeError("Не найдено поле для ввода телефона или логина")
-
-        self._click_first([
-            'button[type="submit"]',
-            'button:has-text("Продолжить")',
-            'button:has-text("Sign in")',
-        ])
-        page.wait_for_load_state("domcontentloaded", timeout=60_000)
-        time.sleep(2)
-
-        if not self._type_into_first(
-            [
-                'input[name="password"]',
-                'input[type="password"]',
-                'input[autocomplete="current-password"]',
-            ],
-            password,
-        ):
-            raise RuntimeError("Не найдено поле для ввода пароля")
-
-        self._click_first([
-            'button[type="submit"]',
-            'button:has-text("Войти")',
-            'button:has-text("Продолжить")',
-        ])
-        page.wait_for_load_state("domcontentloaded", timeout=60_000)
-        time.sleep(3)
-
-        self._handle_sms_if_needed()
-
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            if self.is_logged_in():
-                logging.info("Вход в VK через Playwright выполнен")
-                self.save_session()
-                return
-            time.sleep(2)
-
-        raise RuntimeError("Не удалось подтвердить вход в VK за 2 минуты")
-
-    def ensure_logged_in(self, phone: str, password: str) -> None:
-        if not self.is_logged_in():
-            self.login(phone, password)
-        else:
-            logging.info("Сессия VK активна")
 
     def _normalize_community_url(self, url: str) -> str:
         url = url.strip()

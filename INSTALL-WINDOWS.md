@@ -18,20 +18,21 @@
 
 ## 1. Установка Python
 
-1. Скачайте Python с [python.org/downloads](https://www.python.org/downloads/)
+**Используйте Python 3.12** (рекомендуется). **Не используйте Python 3.14** — на Windows с ним Playwright падает с ошибкой `DLL load failed` / `greenlet`.
+
+1. Скачайте **Python 3.12** с [python.org/downloads](https://www.python.org/downloads/release/python-3120/)
 2. При установке отметьте:
    - **Add python.exe to PATH**
    - **Install pip**
 3. Завершите установку
 
-Проверка в **PowerShell** (от администратора не обязательно):
+Проверка в **PowerShell**:
 
 ```powershell
-python --version
-pip --version
+py -3.12 --version
 ```
 
-Нужен Python **3.10** или выше.
+Нужен Python **3.10–3.13**.
 
 ---
 
@@ -52,11 +53,17 @@ cd C:\vk-community-parser
 ## 3. Виртуальное окружение, зависимости и Chromium
 
 ```powershell
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install --upgrade pip
 pip install -r requirements.txt
 python -m playwright install chromium
+```
+
+Если `py -3.12` недоступен, укажите полный путь к Python 3.12:
+
+```powershell
+& "C:\Program Files\Python312\python.exe" -m venv .venv
 ```
 
 Если PowerShell блокирует активацию venv:
@@ -277,6 +284,7 @@ python -m playwright install chromium
 
 | Проблема | Решение |
 |----------|---------|
+| `DLL load failed` / `greenlet` | Python 3.14 не подходит. Установите **3.12**, пересоздайте `.venv` |
 | `python` не найден | Переустановите Python с **Add to PATH** |
 | Ошибка активации venv | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | `ModuleNotFoundError: vk_api` | Используйте venv: `.\.venv\Scripts\python.exe main.py` |

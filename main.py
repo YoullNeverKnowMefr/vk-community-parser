@@ -6,13 +6,47 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import signal
 import sys
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+
+MIN_PYTHON = (3, 10)
+MAX_PYTHON = (3, 13)
+
+
+def check_runtime() -> None:
+    version = sys.version_info[:3]
+    if version < MIN_PYTHON:
+        print(
+            f"Нужен Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+, "
+            f"у вас {version[0]}.{version[1]}.{version[2]}"
+        )
+        sys.exit(1)
+    if version > MAX_PYTHON:
+        print(
+            f"Python {version[0]}.{version[1]} не поддерживается "
+            "(ошибка greenlet/playwright на Windows).\n"
+            "Установите Python 3.12: https://www.python.org/downloads/\n"
+            "Затем:\n"
+            "  py -3.12 -m venv .venv\n"
+            "  .venv\\Scripts\\activate\n"
+            "  pip install -r requirements.txt\n"
+            "  python -m playwright install chromium"
+        )
+        sys.exit(1)
+    if ".venv" not in str(Path(sys.executable).resolve()).lower():
+        print(
+            "Предупреждение: запуск не из .venv. Рекомендуется:\n"
+            "  python -m venv .venv\n"
+            "  .venv\\Scripts\\activate\n"
+            "  pip install -r requirements.txt"
+        )
+
+
+check_runtime()
 
 from playwright_bot import VkPlaywrightBot, WallPost
 
@@ -97,44 +131,6 @@ def request_shutdown(signum: int, _frame: Any) -> None:
     global _shutdown_requested
     _shutdown_requested = True
     logging.info("Получен сигнал %s, завершение после текущей итерации...", signum)
-
-
-def load_env_file() -> None:
-    env_path = BASE_DIR / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-def get_credentials(
-    args: argparse.Namespace,
-    config: dict[str, Any] | None = None,
-) -> tuple[str, str]:
-    load_env_file()
-    config = config or {}
-    login = (
-        os.environ.get("VK_LOGIN")
-        or args.login
-        or config.get("vk_login")
-        or ""
-    ).strip()
-    password = (
-        os.environ.get("VK_PASSWORD")
-        or args.password
-        or config.get("vk_password")
-        or ""
-    ).strip()
-    if not login or not password:
-        raise ValueError(
-            "Укажите VK_LOGIN и VK_PASSWORD в .env "
-            "или vk_login / vk_password в config.json"
-        )
-    return login, password
 
 
 def post_key(community_url: str, post: WallPost) -> str:
@@ -266,11 +262,9 @@ def run_daemon(
     config: dict[str, Any],
     state: dict[str, Any],
     poll_interval: int,
-    login: str,
-    password: str,
 ) -> None:
     with create_bot(config) as bot:
-        bot.ensure_logged_in(login, password)
+        bot.ensure_logged_in()
         while not _shutdown_requested:
             try:
                 copied = run_once(bot, config, state)
@@ -292,12 +286,10 @@ def main() -> None:
         description="Копирует новые посты из сообществ VK в канал через Playwright",
     )
     parser.add_argument("--once", action="store_true", help="Одна проверка и выход")
-    parser.add_argument("--login", help="Телефон или логин VK (или VK_LOGIN в .env)")
-    parser.add_argument("--password", help="Пароль VK (или VK_PASSWORD в .env)")
     parser.add_argument(
         "--login-only",
         action="store_true",
-        help="Только войти в VK и сохранить сессию браузера",
+        help="Открыть браузер, войти в VK вручную и сохранить сессию",
     )
     parser.add_argument(
         "--reinit",
@@ -325,25 +317,25 @@ def main() -> None:
         state = load_state()
         logging.info("Состояние сброшено")
 
-    login, password = get_credentials(args, config)
-
     if args.login_only:
-        with create_bot(config) as bot:
-            bot.login(login, password)
-        logging.info("Вход выполнен, сессия сохранена в %s", BROWSER_STATE_PATH)
+        login_config = dict(config)
+        login_config["playwright_headless"] = False
+        with create_bot(login_config) as bot:
+            bot.wait_for_manual_login()
+        logging.info("Сессия сохранена в %s", BROWSER_STATE_PATH)
         return
 
     poll_interval = int(config.get("poll_interval_seconds", 300))
 
     if args.once:
         with create_bot(config) as bot:
-            bot.ensure_logged_in(login, password)
+            bot.ensure_logged_in()
             copied = run_once(bot, config, state)
         logging.info("Готово. Скопировано новых постов: %s", copied)
         return
 
     logging.info("Запущен режим мониторинга 24/7. Интервал: %s сек.", poll_interval)
-    run_daemon(config, state, poll_interval, login, password)
+    run_daemon(config, state, poll_interval)
 
 
 if __name__ == "__main__":

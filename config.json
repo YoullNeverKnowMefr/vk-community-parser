@@ -7,5 +7,6 @@
   "poll_interval_seconds": 300,
   "posts_per_check": 20,
   "playwright_headless": false,
-  "playwright_slow_mo_ms": 50
+  "playwright_slow_mo_ms": 50,
+  "manual_login_timeout_seconds": 600
 }
