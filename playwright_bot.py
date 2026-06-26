@@ -33,17 +33,20 @@ class VkPlaywrightBot:
         storage_path: Path,
         headless: bool = False,
         slow_mo_ms: int = 50,
+        fresh: bool = False,
     ) -> None:
         self.storage_path = storage_path
         self.headless = headless
         self.slow_mo_ms = slow_mo_ms
+        self.fresh = fresh
+        self._session_confirmed = False
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
 
     def __enter__(self) -> VkPlaywrightBot:
-        self.start()
+        self.start(fresh=self.fresh)
         return self
 
     def __exit__(self, *_args: Any) -> None:
@@ -55,7 +58,7 @@ class VkPlaywrightBot:
             raise RuntimeError("Браузер не запущен")
         return self._page
 
-    def start(self) -> None:
+    def start(self, *, fresh: bool = False) -> None:
         if self._browser is not None:
             return
 
@@ -68,7 +71,7 @@ class VkPlaywrightBot:
             "locale": "ru-RU",
             "viewport": {"width": 1366, "height": 900},
         }
-        if self.storage_path.exists():
+        if not fresh and self.storage_path.exists():
             context_kwargs["storage_state"] = str(self.storage_path)
 
         self._context = self._browser.new_context(**context_kwargs)
@@ -90,36 +93,61 @@ class VkPlaywrightBot:
         logging.info("Браузер Playwright остановлен")
 
     def save_session(self) -> None:
-        if self._context is None:
+        if self._context is None or not self._session_confirmed:
             return
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
         self._context.storage_state(path=str(self.storage_path))
-        logging.debug("Сессия браузера сохранена: %s", self.storage_path)
+        logging.info("Сессия браузера сохранена: %s", self.storage_path)
+
+    def _has_auth_cookie(self) -> bool:
+        if self._context is None:
+            return False
+        for cookie in self._context.cookies():
+            if cookie.get("name") not in ("remixsid", "remixsid6"):
+                continue
+            if not cookie.get("value"):
+                continue
+            domain = cookie.get("domain", "")
+            if "vk.com" in domain or "vk.ru" in domain:
+                return True
+        return False
 
     def is_logged_in(self) -> bool:
         page = self.page
         page.goto(VK_HOME_URL, wait_until="domcontentloaded", timeout=60_000)
         time.sleep(2)
 
-        if "login" in page.url or "id.vk.com" in page.url:
+        current_url = page.url.lower()
+        if "id.vk.com" in current_url or "/login" in current_url:
             return False
 
-        indicators = [
+        if not self._has_auth_cookie():
+            return False
+
+        login_link = page.locator(
+            'a:has-text("Войти"), button:has-text("Войти"), '
+            '[data-testid="enter-another-account"]'
+        )
+        if login_link.count() > 0 and login_link.first.is_visible():
+            return False
+
+        profile_selectors = [
             "#top_nav_link",
             '[data-testid="leftmenuitem"]',
-            'a[href*="/id"]',
-            'a[href*="/feed"]',
+            ".TopNavBtn--profile",
+            '[data-testid="account-menu"]',
         ]
-        for selector in indicators:
-            if page.locator(selector).count() > 0:
+        for selector in profile_selectors:
+            locator = page.locator(selector).first
+            if locator.count() > 0 and locator.is_visible():
                 return True
 
-        return page.locator('button:has-text("Войти")').count() == 0
+        return False
 
-    def wait_for_manual_login(self) -> None:
-        if self.is_logged_in():
+    def wait_for_manual_login(self, *, force: bool = False) -> None:
+        if not force and self.is_logged_in():
             logging.info("Сессия VK активна")
-            self.save_session()
+            self._session_confirmed = True
             return
 
         if self.headless:
@@ -130,30 +158,32 @@ class VkPlaywrightBot:
             )
 
         page = self.page
-        logging.info("Откройте VK и войдите вручную в браузере")
+        logging.info("Войдите в VK вручную в открытом браузере")
         page.goto(VK_LOGIN_PAGE, wait_until="domcontentloaded", timeout=60_000)
 
         print(
             "\n=== Вход в VK ===\n"
-            "1. Войдите в аккаунт в открывшемся браузере (логин, пароль, SMS).\n"
-            "2. Дождитесь загрузки ленты vk.com.\n"
-            "3. Нажмите Enter в этой консоли.\n"
+            "1. Войдите в аккаунт в браузере (логин, пароль, SMS).\n"
+            "2. Откройте ленту https://vk.com/feed и убедитесь, что вы вошли.\n"
+            "3. Вернитесь в консоль и нажмите Enter.\n"
         )
         input("Нажмите Enter после входа в VK... ")
 
         if not self.is_logged_in():
             raise RuntimeError(
-                "Вход не подтверждён. Убедитесь, что вы авторизованы в VK в браузере"
+                "Вход не подтверждён. Откройте vk.com/feed в браузере и войдите в аккаунт"
             )
 
-        logging.info("Ручной вход выполнен, сессия сохранена")
+        logging.info("Ручной вход подтверждён")
+        self._session_confirmed = True
         self.save_session()
 
     def ensure_logged_in(self) -> None:
-        if not self.is_logged_in():
-            self.wait_for_manual_login()
-        else:
+        if self.is_logged_in():
             logging.info("Сессия VK активна")
+            self._session_confirmed = True
+            return
+        self.wait_for_manual_login()
 
     def _click_first(self, selectors: list[str]) -> bool:
         page = self.page

@@ -250,11 +250,12 @@ def sleep_interruptible(seconds: int) -> None:
         time.sleep(min(1, end_at - time.time()))
 
 
-def create_bot(config: dict[str, Any]) -> VkPlaywrightBot:
+def create_bot(config: dict[str, Any], *, fresh: bool = False) -> VkPlaywrightBot:
     return VkPlaywrightBot(
         storage_path=BROWSER_STATE_PATH,
         headless=bool(config.get("playwright_headless", False)),
         slow_mo_ms=int(config.get("playwright_slow_mo_ms", 50)),
+        fresh=fresh,
     )
 
 
@@ -320,9 +321,8 @@ def main() -> None:
     if args.login_only:
         login_config = dict(config)
         login_config["playwright_headless"] = False
-        with create_bot(login_config) as bot:
-            bot.wait_for_manual_login()
-        logging.info("Сессия сохранена в %s", BROWSER_STATE_PATH)
+        with create_bot(login_config, fresh=True) as bot:
+            bot.wait_for_manual_login(force=True)
         return
 
     poll_interval = int(config.get("poll_interval_seconds", 300))
