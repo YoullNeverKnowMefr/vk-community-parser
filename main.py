@@ -149,10 +149,31 @@ def post_contains_keyword(post: WallPost, keyword: str) -> bool:
     return keyword.lower() in post.text.lower()
 
 
+def post_text_may_be_truncated(text: str) -> bool:
+    lower = text.lower()
+    return (
+        "читать далее" in lower
+        or "показать полностью" in lower
+        or text.rstrip().endswith("…")
+        or text.rstrip().endswith("...")
+    )
+
+
 def post_is_too_old(post: WallPost, max_age_seconds: int) -> bool:
     if post.posted_at is None:
         return False
-    return time.time() - post.posted_at > max_age_seconds
+    age = time.time() - post.posted_at
+    if age < 0:
+        return False
+    if age > 86400 * 7:
+        logging.warning(
+            "Пост %s: подозрительный timestamp %s (возраст %.0f ч) — фильтр по времени не применяю",
+            post.post_id,
+            post.posted_at,
+            age / 3600,
+        )
+        return False
+    return age > max_age_seconds
 
 
 def initialize_baseline(
@@ -203,6 +224,18 @@ def process_community(
 
     for post in new_posts:
         key = post_key(community_url, post)
+        age_info = ""
+        if post.posted_at:
+            age_min = max(0, int((time.time() - post.posted_at) / 60))
+            age_info = f", возраст ~{age_min} мин"
+        logging.info(
+            "Новый пост %s%s: текст %s симв., фото %s",
+            post.post_id,
+            age_info,
+            len(post.text.strip()),
+            len(post.photo_urls),
+        )
+
         if not post.text.strip():
             logging.warning(
                 "Пост %s: текст не извлечён, оставляю для следующей проверки",
@@ -211,6 +244,12 @@ def process_community(
             continue
 
         if not post_contains_keyword(post, keyword):
+            if post_text_may_be_truncated(post.text):
+                logging.warning(
+                    "Пост %s: текст обрезан, ключевое слово не найдено — повторю на следующей проверке",
+                    post.post_id,
+                )
+                continue
             logging.info(
                 "Пост %s: нет ключевого слова «%s» (пропуск)",
                 post.post_id,
@@ -223,10 +262,11 @@ def process_community(
             age_min = int((time.time() - (post.posted_at or 0)) / 60)
             limit_min = int(max_post_age_seconds / 60)
             logging.info(
-                "Пост %s: возраст ~%s мин (лимит %s мин) — пропуск",
+                "Пост %s: возраст ~%s мин (лимит %s мин, ts=%s) — пропуск",
                 post.post_id,
                 age_min,
                 limit_min,
+                post.posted_at,
             )
             seen.add(key)
             continue

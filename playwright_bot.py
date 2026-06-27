@@ -398,7 +398,26 @@ class VkPlaywrightBot:
                     '.post_text',
                     '[class*="Post__text"]',
                     '[class*="wall_text"]',
+                    '[class*="vkitText"]',
                 ];
+
+                const isInsideComments = (el) => {
+                    if (!el) return false;
+                    return Boolean(el.closest(
+                        '.replies, .wall_replies, .wall_reply_list, .reply, .wall_reply, ' +
+                        '.reply_wrap, .reply_box, [class*="Replies"], [class*="Comment"]'
+                    ));
+                };
+
+                const pickPostId = (node) => {
+                    if (!node) return '';
+                    for (const link of node.querySelectorAll('a[href*="wall"]')) {
+                        const match = (link.href || '').match(/wall(-?\\d+_\\d+)/i);
+                        if (match) return match[1];
+                    }
+                    return node.getAttribute('data-post-id')
+                        || (node.id || '').replace(/^post-/, '');
+                };
 
                 const excludeFromPost = (root) => {
                     const clone = root.cloneNode(true);
@@ -495,28 +514,44 @@ class VkPlaywrightBot:
 
                 const pickPostedAt = (node) => {
                     if (!node) return null;
-                    const timeEl = node.querySelector(
-                        'time[datetime], time[data-date], time[data-time], [data-testid="post_date"] time'
-                    );
-                    if (timeEl) {
-                        const raw = timeEl.getAttribute('datetime')
-                            || timeEl.getAttribute('data-date')
-                            || timeEl.getAttribute('data-time');
-                        if (raw) {
-                            const ts = Math.floor(new Date(raw).getTime() / 1000);
-                            if (!Number.isNaN(ts) && ts > 0) return ts;
+                    const timeSelectors = [
+                        '.PostHeader time[datetime]',
+                        '.PostHeader time[data-date]',
+                        '.PostHeader [data-date]',
+                        '.wall_head .rel_date[data-date]',
+                        '[data-testid="post_date"] time',
+                        '[data-testid="post_date"] [data-date]',
+                        '.post_info .rel_date[data-date]',
+                        '.wall_post_cont .rel_date[data-date]',
+                    ];
+                    const parseRaw = (raw) => {
+                        if (!raw) return null;
+                        const num = parseInt(raw, 10);
+                        if (!Number.isNaN(num) && num > 1_000_000_000 && num < 10_000_000_000) {
+                            return num;
+                        }
+                        if (!Number.isNaN(num) && num >= 10_000_000_000) {
+                            return Math.floor(num / 1000);
+                        }
+                        const ts = Math.floor(new Date(raw).getTime() / 1000);
+                        if (!Number.isNaN(ts) && ts > 0) return ts;
+                        return null;
+                    };
+                    for (const sel of timeSelectors) {
+                        for (const el of node.querySelectorAll(sel)) {
+                            if (isInsideComments(el)) continue;
+                            const raw = el.getAttribute('datetime')
+                                || el.getAttribute('data-date')
+                                || el.getAttribute('data-time');
+                            const ts = parseRaw(raw);
+                            if (ts) return ts;
                         }
                     }
-                    const dated = node.querySelector('[data-date], [data-time], .rel_date');
-                    if (dated) {
-                        const raw = dated.getAttribute('data-date')
-                            || dated.getAttribute('data-time');
-                        if (raw) {
-                            const num = parseInt(raw, 10);
-                            if (!Number.isNaN(num) && num > 1_000_000_000) return num;
-                            const ts = Math.floor(new Date(raw).getTime() / 1000);
-                            if (!Number.isNaN(ts) && ts > 0) return ts;
-                        }
+                    for (const el of node.querySelectorAll('time[datetime], .rel_date[data-date]')) {
+                        if (isInsideComments(el)) continue;
+                        const raw = el.getAttribute('datetime') || el.getAttribute('data-date');
+                        const ts = parseRaw(raw);
+                        if (ts) return ts;
                     }
                     return null;
                 };
@@ -533,9 +568,7 @@ class VkPlaywrightBot:
                 };
 
                 for (const node of document.querySelectorAll('[data-post-id], div[id^="post-"]')) {
-                    const postId = node.getAttribute('data-post-id')
-                        || (node.id || '').replace(/^post-/, '');
-                    pushPost(postId, node);
+                    pushPost(pickPostId(node), node);
                 }
 
                 for (const link of document.querySelectorAll('a[href*="wall"]')) {
