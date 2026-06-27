@@ -149,6 +149,12 @@ def post_contains_keyword(post: WallPost, keyword: str) -> bool:
     return keyword.lower() in post.text.lower()
 
 
+def post_is_too_old(post: WallPost, max_age_seconds: int) -> bool:
+    if post.posted_at is None:
+        return False
+    return time.time() - post.posted_at > max_age_seconds
+
+
 def initialize_baseline(
     bot: VkPlaywrightBot,
     config: dict[str, Any],
@@ -187,6 +193,7 @@ def process_community(
     keyword: str,
     posts_per_check: int,
     state: dict[str, Any],
+    max_post_age_seconds: int,
 ) -> int:
     copied = 0
     seen = processed_set(state)
@@ -208,6 +215,18 @@ def process_community(
                 "Пост %s: нет ключевого слова «%s» (пропуск)",
                 post.post_id,
                 keyword,
+            )
+            seen.add(key)
+            continue
+
+        if post_is_too_old(post, max_post_age_seconds):
+            age_min = int((time.time() - (post.posted_at or 0)) / 60)
+            limit_min = int(max_post_age_seconds / 60)
+            logging.info(
+                "Пост %s: возраст ~%s мин (лимит %s мин) — пропуск",
+                post.post_id,
+                age_min,
+                limit_min,
             )
             seen.add(key)
             continue
@@ -251,6 +270,7 @@ def process_community(
 def run_once(bot: VkPlaywrightBot, config: dict[str, Any], state: dict[str, Any]) -> int:
     keyword = config.get("keyword", "Мы теперь и в Мах")
     posts_per_check = int(config.get("posts_per_check", 20))
+    max_post_age_seconds = int(config.get("max_post_age_seconds", 3600))
     source_urls = config.get("source_community_urls", [])
     target_channel_url = config.get("target_channel_url", DEFAULT_TARGET_CHANNEL_URL)
 
@@ -270,6 +290,7 @@ def run_once(bot: VkPlaywrightBot, config: dict[str, Any], state: dict[str, Any]
             keyword,
             posts_per_check,
             state,
+            max_post_age_seconds,
         )
 
     save_state(state)

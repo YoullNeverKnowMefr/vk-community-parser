@@ -43,6 +43,7 @@ class WallPost:
     text: str
     photo_urls: list[str] = field(default_factory=list)
     community_url: str = ""
+    posted_at: int | None = None
 
 
 class VkPlaywrightBot:
@@ -383,8 +384,6 @@ class VkPlaywrightBot:
         url = self._normalize_community_url(community_url)
         logging.info("Открываю стену сообщества: %s", url)
         self._open_community_wall(url)
-
-        self._open_community_wall(url)
         self._expand_truncated_posts()
 
         raw_posts: list[dict[str, Any]] = self.page.evaluate(
@@ -399,30 +398,68 @@ class VkPlaywrightBot:
                     '.post_text',
                     '[class*="Post__text"]',
                     '[class*="wall_text"]',
-                    '[class*="vkitText"]',
                 ];
+
+                const excludeFromPost = (root) => {
+                    const clone = root.cloneNode(true);
+                    const junkSelectors = [
+                        '.replies', '.wall_replies', '.wall_reply_list',
+                        '.reply', '.wall_reply', '.reply_wrap', '.reply_box',
+                        '[class*="Comment"]', '[class*="Reply"]', '[class*="Replies"]',
+                        '[class*="PostHeader"]', '.PostHeader', 'header',
+                        '[data-testid="post_header"]', '[class*="PostFooter"]',
+                        '[class*="LikeButton"]', '[class*="Share"]',
+                    ];
+                    for (const sel of junkSelectors) {
+                        clone.querySelectorAll(sel).forEach((el) => el.remove());
+                    }
+                    clone.querySelectorAll(
+                        '[class*="Avatar"], [class*="avatar"], img[class*="Avatar"]'
+                    ).forEach((el) => el.remove());
+                    return clone;
+                };
+
+                const pickPostContentRoot = (node) => {
+                    if (!node) return null;
+                    return excludeFromPost(node);
+                };
 
                 const isPostPhoto = (img) => {
                     if (!img) return false;
-                    if (img.closest('[class*="Avatar"], [class*="PostHeader"], .PostHeader, .reply')) {
+                    if (img.closest(
+                        '[class*="Avatar"], [class*="avatar"], [class*="PostHeader"], .PostHeader, ' +
+                        '.reply, .wall_reply, [class*="Comment"], [class*="Reply"], [class*="Replies"], ' +
+                        '[class*="OwnerPhoto"], [class*="RichAvatar"], [class*="PostAuthor"]'
+                    )) {
                         return false;
                     }
                     const w = img.naturalWidth || img.width || 0;
                     const h = img.naturalHeight || img.height || 0;
                     if (w > 0 && h > 0 && (w < 80 || h < 80)) return false;
-                    const src = img.currentSrc || img.src || '';
+                    const src = (img.currentSrc || img.src || '').toLowerCase();
                     if (!src || src.startsWith('data:') || src.includes('emoji')) return false;
+                    if (/ava\\d|camera_|\\/images\\/(u|o)\\//.test(src)) return false;
+                    if (/[?&](cs|pp|sz|size|w|h)=(\\d{1,2}x\\d{1,2}|\\d{1,2})(&|$)/.test(src)) {
+                        return false;
+                    }
                     return true;
                 };
 
                 const pickText = (node) => {
+                    const root = pickPostContentRoot(node);
+                    if (!root) return '';
                     for (const sel of textSelectors) {
-                        const el = node.querySelector(sel);
+                        const el = root.querySelector(sel);
                         if (el && el.innerText.trim()) return el.innerText.trim();
                     }
-                    const copy = node.cloneNode(true);
+                    const body = root.querySelector(
+                        '[class*="Post__content"], .post_content, .wall_post_cont'
+                    );
+                    if (!body) return '';
+                    const copy = body.cloneNode(true);
                     for (const junk of copy.querySelectorAll(
-                        'button, [role="button"], time, img, video, [class*="ShowMore"]'
+                        'button, [role="button"], time, img, video, [class*="ShowMore"], ' +
+                        '[class*="MediaGrid"], .post_media_wrap, .page_post_thumb_wrap'
                     )) {
                         junk.remove();
                     }
@@ -430,17 +467,58 @@ class VkPlaywrightBot:
                 };
 
                 const pickPhotos = (node) => {
+                    const root = pickPostContentRoot(node);
+                    if (!root) return [];
+                    const attachmentSelectors = [
+                        '.post_media_wrap img',
+                        '.page_post_thumb_wrap img',
+                        '.MediaGrid img',
+                        '.thumb_map img',
+                        '.vkitPhotoAlbumPhoto__image',
+                        '[class*="MediaGrid"] img',
+                        '[class*="PhotoAlbumPhoto"] img',
+                        '[class*="PrimaryAttachment"] img',
+                    ];
                     const photoUrls = [];
-                    if (!node) return photoUrls;
-                    const imgs = node.querySelectorAll(
-                        'a.page_post_thumb_wrap img, .MediaGrid img, .vkitPhotoAlbumPhoto__image, [class*="Photo"] img, img'
-                    );
-                    for (const img of imgs) {
-                        if (!isPostPhoto(img)) continue;
-                        const src = img.currentSrc || img.src || '';
-                        if (!photoUrls.includes(src)) photoUrls.push(src);
+                    const seenUrls = new Set();
+                    for (const sel of attachmentSelectors) {
+                        for (const img of root.querySelectorAll(sel)) {
+                            if (!isPostPhoto(img)) continue;
+                            const src = img.currentSrc || img.src || '';
+                            if (!src || seenUrls.has(src)) continue;
+                            seenUrls.add(src);
+                            photoUrls.push(src);
+                        }
                     }
                     return photoUrls;
+                };
+
+                const pickPostedAt = (node) => {
+                    if (!node) return null;
+                    const timeEl = node.querySelector(
+                        'time[datetime], time[data-date], time[data-time], [data-testid="post_date"] time'
+                    );
+                    if (timeEl) {
+                        const raw = timeEl.getAttribute('datetime')
+                            || timeEl.getAttribute('data-date')
+                            || timeEl.getAttribute('data-time');
+                        if (raw) {
+                            const ts = Math.floor(new Date(raw).getTime() / 1000);
+                            if (!Number.isNaN(ts) && ts > 0) return ts;
+                        }
+                    }
+                    const dated = node.querySelector('[data-date], [data-time], .rel_date');
+                    if (dated) {
+                        const raw = dated.getAttribute('data-date')
+                            || dated.getAttribute('data-time');
+                        if (raw) {
+                            const num = parseInt(raw, 10);
+                            if (!Number.isNaN(num) && num > 1_000_000_000) return num;
+                            const ts = Math.floor(new Date(raw).getTime() / 1000);
+                            if (!Number.isNaN(ts) && ts > 0) return ts;
+                        }
+                    }
+                    return null;
                 };
 
                 const pushPost = (postId, node) => {
@@ -450,6 +528,7 @@ class VkPlaywrightBot:
                         post_id: postId,
                         text: node ? pickText(node) : '',
                         photo_urls: pickPhotos(node),
+                        posted_at: node ? pickPostedAt(node) : null,
                     });
                 };
 
@@ -480,17 +559,23 @@ class VkPlaywrightBot:
                 text=str(item.get("text") or ""),
                 photo_urls=[str(u) for u in item.get("photo_urls", []) if u],
                 community_url=url,
+                posted_at=int(item["posted_at"]) if item.get("posted_at") else None,
             )
             for item in raw_posts
         ]
         logging.info("Найдено постов на стене: %s", len(posts))
         for post in posts[:5]:
             preview = post.text.replace("\n", " ")[:80]
+            age = ""
+            if post.posted_at:
+                age_min = max(0, int((time.time() - post.posted_at) / 60))
+                age = f", возраст ~{age_min} мин"
             logging.info(
-                "  пост %s: %s%s",
+                "  пост %s: %s%s%s",
                 post.post_id,
                 preview or "(текст не извлечён)",
                 "..." if len(post.text) > 80 else "",
+                age,
             )
         return posts
 
