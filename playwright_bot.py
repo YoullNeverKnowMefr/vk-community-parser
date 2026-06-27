@@ -463,6 +463,109 @@ class VkPlaywrightBot:
             paths.append(Path(temp.name))
         return paths
 
+    def _channel_peer_id(self, channel_url: str) -> str | None:
+        match = re.search(r"-(\d+)", channel_url)
+        return f"-{match.group(1)}" if match else None
+
+    def _open_channel(self, channel_url: str) -> None:
+        page = self.page
+        logging.info("Открываю канал: %s", channel_url)
+        page.goto(channel_url, wait_until="domcontentloaded", timeout=60_000)
+        time.sleep(3)
+
+        peer_id = self._channel_peer_id(channel_url)
+        if peer_id and not self._has_message_input():
+            alt_url = f"https://vk.com/im?sel={peer_id}"
+            logging.info("Пробую альтернативный URL канала: %s", alt_url)
+            page.goto(alt_url, wait_until="domcontentloaded", timeout=60_000)
+            time.sleep(3)
+
+        self._click_first([
+            'button:has-text("Написать")',
+            '[data-testid="convo_composer_input"]',
+            ".ConvoComposer",
+            ".im-chat-input",
+            ".Composer",
+        ])
+        time.sleep(1)
+
+    def _has_message_input(self) -> bool:
+        page = self.page
+        selectors = [
+            '[data-testid="mail_text_input"] [contenteditable="true"]',
+            '[data-testid="convo_composer_input"]',
+            ".ConvoComposer [contenteditable='true']",
+            ".im-chat-input--text [contenteditable='true']",
+            '[role="textbox"][contenteditable="true"]',
+            "div[contenteditable='true']",
+        ]
+        for selector in selectors:
+            field = page.locator(selector).first
+            if field.count() > 0 and field.is_visible():
+                return True
+        return False
+
+    def _focus_message_input(self) -> bool:
+        page = self.page
+        input_selectors = [
+            '[data-testid="mail_text_input"] [contenteditable="true"]',
+            '[data-testid="convo_composer_input"]',
+            ".ConvoComposer [contenteditable='true']",
+            ".composer_richtext [contenteditable='true']",
+            ".im-chat-input--text [contenteditable='true']",
+            ".im_editable[contenteditable='true']",
+            '[role="textbox"][contenteditable="true"]',
+            '[contenteditable="true"][data-placeholder]',
+            '[contenteditable="true"][aria-label*="Сообщение" i]',
+            '[contenteditable="true"][aria-label*="сообщение" i]',
+        ]
+
+        for selector in input_selectors:
+            fields = page.locator(selector)
+            for index in range(min(fields.count(), 5)):
+                field = fields.nth(index)
+                if not field.is_visible():
+                    continue
+                try:
+                    field.scroll_into_view_if_needed(timeout=3_000)
+                    field.click(timeout=5_000)
+                    return True
+                except PlaywrightError:
+                    continue
+
+        try:
+            clicked = page.evaluate(
+                """() => {
+                    const isVisible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 40 && rect.height > 16 && rect.bottom > 0;
+                    };
+                    const fields = Array.from(
+                        document.querySelectorAll('[contenteditable="true"], [role="textbox"]')
+                    ).filter(isVisible);
+                    const bottomField = fields.sort(
+                        (a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom
+                    )[0];
+                    if (!bottomField) return false;
+                    bottomField.focus();
+                    bottomField.click();
+                    return true;
+                }"""
+            )
+            return bool(clicked)
+        except PlaywrightError:
+            return False
+
+    def _type_message(self, text: str) -> None:
+        page = self.page
+        if text:
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+            page.keyboard.type(text, delay=15)
+        else:
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+
     def publish_to_channel(
         self,
         channel_url: str,
@@ -474,31 +577,23 @@ class VkPlaywrightBot:
         temp_files: list[Path] = []
 
         try:
-            logging.info("Публикую в канал: %s", channel_url)
-            page.goto(channel_url, wait_until="domcontentloaded", timeout=60_000)
-            time.sleep(3)
+            self._open_channel(channel_url)
 
-            input_selectors = [
-                '[data-testid="mail_text_input"] div[contenteditable="true"]',
-                '.composer_richtext [contenteditable="true"]',
-                '.im-chat-input--text [contenteditable="true"]',
-                'div[contenteditable="true"]',
-            ]
-            typed = False
-            for selector in input_selectors:
-                field = page.locator(selector).first
-                if field.count() == 0 or not field.is_visible():
-                    continue
-                field.click()
-                page.keyboard.press("Control+A")
-                page.keyboard.press("Backspace")
-                if text:
-                    page.keyboard.type(text, delay=20)
-                typed = True
-                break
+            try:
+                page.wait_for_selector(
+                    '[contenteditable="true"], [role="textbox"], [data-testid="convo_composer_input"]',
+                    timeout=15_000,
+                )
+            except PlaywrightError:
+                logging.warning("Поле ввода не появилось за 15 сек, продолжаю поиск...")
 
-            if not typed:
-                raise RuntimeError("Не найдено поле ввода сообщения в канале")
+            if not self._focus_message_input():
+                raise RuntimeError(
+                    "Не найдено поле ввода сообщения в канале. "
+                    f"URL: {page.url}. Убедитесь, что аккаунт — админ канала."
+                )
+
+            self._type_message(text)
 
             if photo_urls:
                 temp_files = self._download_photos(photo_urls)
@@ -533,9 +628,12 @@ class VkPlaywrightBot:
 
             sent = self._click_first([
                 '[data-testid="send_button"]',
+                '[data-testid="convo_send_button"]',
                 'button[aria-label*="Отправить" i]',
+                'button[aria-label*="отправить" i]',
                 'button:has-text("Отправить")',
-                '.im-send-btn',
+                ".im-send-btn",
+                ".ConvoComposer__sendButton",
             ])
             if not sent:
                 page.keyboard.press("Enter")
