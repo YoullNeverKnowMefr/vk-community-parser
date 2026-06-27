@@ -189,9 +189,27 @@ def process_community(
         if key in seen:
             continue
 
+        if not post.text.strip():
+            logging.warning(
+                "Пост %s: текст не извлечён, оставляю для следующей проверки",
+                post.post_id,
+            )
+            continue
+
         if not post_contains_keyword(post, keyword):
+            logging.info(
+                "Пост %s: нет ключевого слова «%s» (пропуск)",
+                post.post_id,
+                keyword,
+            )
             seen.add(key)
             continue
+
+        logging.info(
+            "Новый пост %s с ключевым словом «%s»",
+            post.post_id,
+            keyword,
+        )
 
         try:
             bot.publish_to_channel(target_channel_url, post.text, post.photo_urls)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -12,10 +13,28 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
-from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Error as PlaywrightError
+from playwright.sync_api import Page, Playwright, sync_playwright
 
 VK_HOME_URL = "https://vk.com/feed"
-VK_LOGIN_PAGE = "https://id.vk.com/auth"
+VK_START_URL = "https://vk.com"
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+AUTH_COOKIE_NAMES = ("remixsid", "remixsid6", "remixstid", "remixnsid")
+LOGGED_IN_PATH_HINTS = (
+    "/feed",
+    "/id",
+    "/club",
+    "/public",
+    "/im",
+    "/mail",
+    "/friends",
+    "/groups",
+    "/settings",
+)
 
 
 @dataclass
@@ -40,6 +59,7 @@ class VkPlaywrightBot:
         self.slow_mo_ms = slow_mo_ms
         self.fresh = fresh
         self._session_confirmed = False
+        self._session_saved = False
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
@@ -59,28 +79,33 @@ class VkPlaywrightBot:
         return self._page
 
     def start(self, *, fresh: bool = False) -> None:
-        if self._browser is not None:
+        if self._context is not None:
             return
 
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
+        profile_dir = self.storage_path.parent / "playwright_profile"
+        if fresh and profile_dir.exists():
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        self._context = self._playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
             headless=self.headless,
             slow_mo=self.slow_mo_ms,
+            locale="ru-RU",
+            viewport={"width": 1366, "height": 900},
+            user_agent=CHROME_USER_AGENT,
+            ignore_default_args=["--enable-automation"],
+            args=["--disable-blink-features=AutomationControlled"],
         )
-        context_kwargs: dict[str, Any] = {
-            "locale": "ru-RU",
-            "viewport": {"width": 1366, "height": 900},
-        }
-        if not fresh and self.storage_path.exists():
-            context_kwargs["storage_state"] = str(self.storage_path)
-
-        self._context = self._browser.new_context(**context_kwargs)
-        self._page = self._context.new_page()
-        logging.info("Браузер Playwright запущен")
+        self._browser = None
+        self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+        logging.info("Браузер Playwright запущен (профиль: %s)", profile_dir)
 
     def stop(self) -> None:
         if self._context is not None:
-            self.save_session()
+            if self._session_confirmed and not self._session_saved:
+                self.save_session()
             self._context.close()
             self._context = None
         if self._browser is not None:
@@ -93,17 +118,18 @@ class VkPlaywrightBot:
         logging.info("Браузер Playwright остановлен")
 
     def save_session(self) -> None:
-        if self._context is None or not self._session_confirmed:
+        if self._context is None or not self._session_confirmed or self._session_saved:
             return
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
         self._context.storage_state(path=str(self.storage_path))
+        self._session_saved = True
         logging.info("Сессия браузера сохранена: %s", self.storage_path)
 
     def _has_auth_cookie(self) -> bool:
         if self._context is None:
             return False
         for cookie in self._context.cookies():
-            if cookie.get("name") not in ("remixsid", "remixsid6"):
+            if cookie.get("name") not in AUTH_COOKIE_NAMES:
                 continue
             if not cookie.get("value"):
                 continue
@@ -112,25 +138,32 @@ class VkPlaywrightBot:
                 return True
         return False
 
-    def is_logged_in(self) -> bool:
+    def _ensure_page_open(self) -> Page:
         page = self.page
-        page.goto(VK_HOME_URL, wait_until="domcontentloaded", timeout=60_000)
-        time.sleep(2)
+        if page.is_closed():
+            raise RuntimeError(
+                "Браузер закрыт. Не закрывайте окно Chromium до завершения входа"
+            )
+        return page
 
-        current_url = page.url.lower()
-        if "id.vk.com" in current_url or "/login" in current_url:
-            return False
+    def _is_auth_url(self, url: str) -> bool:
+        lowered = url.lower()
+        return "id.vk.com/auth" in lowered or (
+            "vk.com" in lowered and "/login" in lowered
+        )
 
-        if not self._has_auth_cookie():
-            return False
+    def _is_vk_site_url(self, url: str) -> bool:
+        lowered = url.lower()
+        return "vk.com" in lowered or "vk.ru" in lowered
 
+    def _has_visible_login_prompt(self, page: Page) -> bool:
         login_link = page.locator(
             'a:has-text("Войти"), button:has-text("Войти"), '
             '[data-testid="enter-another-account"]'
         )
-        if login_link.count() > 0 and login_link.first.is_visible():
-            return False
+        return login_link.count() > 0 and login_link.first.is_visible()
 
+    def _has_visible_profile(self, page: Page) -> bool:
         profile_selectors = [
             "#top_nav_link",
             '[data-testid="leftmenuitem"]',
@@ -141,8 +174,83 @@ class VkPlaywrightBot:
             locator = page.locator(selector).first
             if locator.count() > 0 and locator.is_visible():
                 return True
-
         return False
+
+    def _has_vk_user_id(self, page: Page) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    """() => {
+                        if (window.cur && window.cur.user_id) return true;
+                        if (window.vk && window.vk.id) return true;
+                        const node = document.querySelector('[data-user-id]');
+                        return !!(node && node.getAttribute('data-user-id'));
+                    }"""
+                )
+            )
+        except PlaywrightError:
+            return False
+
+    def _is_vk_homepage(self, url: str) -> bool:
+        return bool(re.match(r"https?://(www\.)?vk\.(com|ru)/?$", url, re.I))
+
+    def _page_looks_logged_in(self, page: Page) -> bool:
+        if page.is_closed():
+            return False
+
+        current_url = page.url.lower()
+        if self._is_auth_url(current_url):
+            return False
+        if not self._is_vk_site_url(current_url):
+            return False
+        if self._has_vk_user_id(page):
+            return True
+        if self._has_auth_cookie() and not self._has_visible_login_prompt(page):
+            return True
+        if self._has_visible_login_prompt(page):
+            return False
+        if self._has_visible_profile(page):
+            return True
+        if any(hint in current_url for hint in LOGGED_IN_PATH_HINTS):
+            return True
+        if self._is_vk_homepage(page.url) and not self._has_visible_login_prompt(page):
+            return True
+        return False
+
+    def _ask_save_session(self, page: Page) -> bool:
+        print(f"\nАвтопроверка не уверена. Текущий URL: {page.url}")
+        if self._is_auth_url(page.url):
+            print("Откройте https://vk.com и войдите через кнопку «Войти» на сайте.")
+            return False
+        answer = input("Сохранить текущую сессию как успешный вход? (y/N): ").strip().lower()
+        return answer in ("y", "yes", "д", "да")
+
+    def _safe_goto_feed(self) -> None:
+        page = self._ensure_page_open()
+        if self._page_looks_logged_in(page):
+            return
+
+        try:
+            page.goto(VK_HOME_URL, wait_until="domcontentloaded", timeout=60_000)
+        except PlaywrightError as error:
+            message = str(error).lower()
+            if "interrupted" in message or "target closed" in message:
+                time.sleep(3)
+            else:
+                raise
+        time.sleep(1)
+
+    def is_logged_in(self, *, navigate: bool = True) -> bool:
+        page = self._ensure_page_open()
+
+        if self._page_looks_logged_in(page):
+            return True
+
+        if not navigate:
+            return False
+
+        self._safe_goto_feed()
+        return self._page_looks_logged_in(page)
 
     def wait_for_manual_login(self, *, force: bool = False) -> None:
         if not force and self.is_logged_in():
@@ -158,25 +266,36 @@ class VkPlaywrightBot:
             )
 
         page = self.page
-        logging.info("Войдите в VK вручную в открытом браузере")
-        page.goto(VK_LOGIN_PAGE, wait_until="domcontentloaded", timeout=60_000)
+        logging.info("Откройте VK и войдите вручную: %s", VK_START_URL)
+        page.goto(VK_START_URL, wait_until="domcontentloaded", timeout=60_000)
 
         print(
             "\n=== Вход в VK ===\n"
-            "1. Войдите в аккаунт в браузере (логин, пароль, SMS).\n"
-            "2. Откройте ленту https://vk.com/feed и убедитесь, что вы вошли.\n"
-            "3. Вернитесь в консоль и нажмите Enter.\n"
+            "1. В браузере открыт https://vk.com (не id.vk.com).\n"
+            "2. Нажмите «Войти» на сайте VK, если нужно, и пройдите SMS.\n"
+            "3. Убедитесь, что видите ленту или свой профиль.\n"
+            "4. Не закрывайте окно браузера.\n"
+            "5. Нажмите Enter в этой консоли.\n"
         )
         input("Нажмите Enter после входа в VK... ")
 
-        if not self.is_logged_in():
-            raise RuntimeError(
-                "Вход не подтверждён. Откройте vk.com/feed в браузере и войдите в аккаунт"
-            )
+        page = self._ensure_page_open()
+        if self.is_logged_in(navigate=False):
+            logging.info("Ручной вход подтверждён")
+            self._session_confirmed = True
+            self.save_session()
+            return
 
-        logging.info("Ручной вход подтверждён")
-        self._session_confirmed = True
-        self.save_session()
+        if self._ask_save_session(page):
+            logging.info("Сессия сохранена по подтверждению пользователя")
+            self._session_confirmed = True
+            self.save_session()
+            return
+
+        raise RuntimeError(
+            "Вход не подтверждён. Откройте https://vk.com или https://vk.com/feed "
+            "в окне Playwright и повторите --login-only"
+        )
 
     def ensure_logged_in(self) -> None:
         if self.is_logged_in():
@@ -204,48 +323,103 @@ class VkPlaywrightBot:
             raise ValueError(f"Некорректная ссылка на сообщество: {url}")
         return url
 
-    def collect_wall_posts(self, community_url: str, *, limit: int) -> list[WallPost]:
+    def _open_community_wall(self, url: str) -> None:
         page = self.page
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        time.sleep(2)
+
+        wall_tab_selectors = [
+            'a[href*="w=wall"]',
+            'a:has-text("Стена")',
+            '[data-testid="group_tab_wall"]',
+            '#wall_tabs a.wall_tab',
+        ]
+        for selector in wall_tab_selectors:
+            tab = page.locator(selector).first
+            if tab.count() == 0 or not tab.is_visible():
+                continue
+            try:
+                tab.click(timeout=5_000)
+                time.sleep(2)
+                break
+            except PlaywrightError:
+                continue
+
+        try:
+            page.wait_for_selector(
+                '[data-post-id], div[id^="post-"], a[href*="wall"]',
+                timeout=15_000,
+            )
+        except PlaywrightError:
+            logging.warning("Посты на стене не появились за 15 сек, продолжаю...")
+
+        for _ in range(8):
+            page.mouse.wheel(0, 2000)
+            time.sleep(0.8)
+
+    def collect_wall_posts(self, community_url: str, *, limit: int) -> list[WallPost]:
         url = self._normalize_community_url(community_url)
         logging.info("Открываю стену сообщества: %s", url)
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        time.sleep(3)
+        self._open_community_wall(url)
 
-        for _ in range(3):
-            page.mouse.wheel(0, 2500)
-            time.sleep(1)
-
-        raw_posts: list[dict[str, Any]] = page.evaluate(
+        raw_posts: list[dict[str, Any]] = self.page.evaluate(
             """(limit) => {
                 const result = [];
                 const seen = new Set();
-                const nodes = document.querySelectorAll('[data-post-id], div[id^="post-"]');
 
-                for (const node of nodes) {
-                    if (result.length >= limit) break;
+                const textSelectors = [
+                    '.wall_post_text',
+                    '.vkitPost__text',
+                    '[data-testid="post_text"]',
+                    '.post_text',
+                    '[class*="Post__text"]',
+                    '[class*="wall_text"]',
+                    '[class*="vkitText"]',
+                ];
 
+                const pickText = (node) => {
+                    for (const sel of textSelectors) {
+                        const el = node.querySelector(sel);
+                        if (el && el.innerText.trim()) return el.innerText.trim();
+                    }
+                    const copy = node.cloneNode(true);
+                    for (const junk of copy.querySelectorAll('button, [role="button"], time, img, video')) {
+                        junk.remove();
+                    }
+                    return (copy.innerText || '').trim();
+                };
+
+                const pushPost = (postId, node) => {
+                    if (!postId || seen.has(postId) || result.length >= limit) return;
+                    seen.add(postId);
+                    const text = node ? pickText(node) : '';
+                    const photoUrls = [];
+                    if (node) {
+                        for (const img of node.querySelectorAll('img')) {
+                            const src = img.currentSrc || img.src || '';
+                            if (!src || src.startsWith('data:') || src.includes('emoji')) continue;
+                            if (!photoUrls.includes(src)) photoUrls.push(src);
+                        }
+                    }
+                    result.push({ post_id: postId, text, photo_urls: photoUrls });
+                };
+
+                for (const node of document.querySelectorAll('[data-post-id], div[id^="post-"]')) {
                     const postId = node.getAttribute('data-post-id')
                         || (node.id || '').replace(/^post-/, '');
-                    if (!postId || seen.has(postId)) continue;
-                    seen.add(postId);
-
-                    const textNode = node.querySelector(
-                        '.wall_post_text, .vkitPost__text, [data-testid="post_text"], .post_text'
-                    );
-                    const text = textNode ? textNode.innerText.trim() : '';
-
-                    const photoUrls = [];
-                    const imgs = node.querySelectorAll(
-                        'a.page_post_thumb_wrap img, .MediaGrid img, .vkitPhotoAlbumPhoto__image, img'
-                    );
-                    for (const img of imgs) {
-                        const src = img.currentSrc || img.src || '';
-                        if (!src || src.startsWith('data:')) continue;
-                        if (!photoUrls.includes(src)) photoUrls.push(src);
-                    }
-
-                    result.push({ post_id: postId, text, photo_urls: photoUrls });
+                    pushPost(postId, node);
                 }
+
+                for (const link of document.querySelectorAll('a[href*="wall"]')) {
+                    const match = (link.href || '').match(/wall(-?\\d+)_([\\d]+)/i);
+                    if (!match) continue;
+                    const postId = `${match[1]}_${match[2]}`;
+                    const container = link.closest(
+                        '[data-post-id], [id^="post-"], article, [class*="Post"]'
+                    ) || link.parentElement?.parentElement?.parentElement;
+                    if (!seen.has(postId)) pushPost(postId, container);
+                }
+
                 return result;
             }""",
             limit,
@@ -261,6 +435,14 @@ class VkPlaywrightBot:
             for item in raw_posts
         ]
         logging.info("Найдено постов на стене: %s", len(posts))
+        for post in posts[:5]:
+            preview = post.text.replace("\n", " ")[:80]
+            logging.info(
+                "  пост %s: %s%s",
+                post.post_id,
+                preview or "(текст не извлечён)",
+                "..." if len(post.text) > 80 else "",
+            )
         return posts
 
     def _download_photos(self, urls: list[str]) -> list[Path]:
