@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import signal
 import sys
 import time
@@ -133,8 +134,15 @@ def request_shutdown(signum: int, _frame: Any) -> None:
     logging.info("Получен сигнал %s, завершение после текущей итерации...", signum)
 
 
+def normalize_post_id(post_id: str) -> str:
+    post_id = post_id.strip()
+    if re.match(r"^-?\d+_\d+$", post_id):
+        return post_id
+    return post_id
+
+
 def post_key(community_url: str, post: WallPost) -> str:
-    return f"{community_url}::{post.post_id}"
+    return f"{community_url}::{normalize_post_id(post.post_id)}"
 
 
 def post_contains_keyword(post: WallPost, keyword: str) -> bool:
@@ -160,7 +168,7 @@ def initialize_baseline(
         for post in posts:
             seen.add(post_key(community_url, post))
         logging.info(
-            "Инициализация %s: помечено %s постов как старые",
+            "Инициализация %s: помечено %s постов как старые (только с момента запуска — новые)",
             community_url,
             len(posts),
         )
@@ -183,12 +191,11 @@ def process_community(
     copied = 0
     seen = processed_set(state)
     posts = bot.collect_wall_posts(community_url, limit=posts_per_check)
+    new_posts = [p for p in posts if post_key(community_url, p) not in seen]
+    logging.info("Новых постов на стене (не из baseline): %s", len(new_posts))
 
-    for post in posts:
+    for post in new_posts:
         key = post_key(community_url, post)
-        if key in seen:
-            continue
-
         if not post.text.strip():
             logging.warning(
                 "Пост %s: текст не извлечён, оставляю для следующей проверки",
@@ -212,7 +219,12 @@ def process_community(
         )
 
         try:
-            bot.publish_to_channel(target_channel_url, post.text, post.photo_urls)
+            bot.publish_to_channel(
+                target_channel_url,
+                post.text,
+                post.photo_urls,
+                return_to_url=community_url,
+            )
         except Exception as error:
             logging.error(
                 "Ошибка публикации поста %s из %s: %s",
@@ -223,6 +235,8 @@ def process_community(
             continue
 
         seen.add(key)
+        state["processed"] = sorted(seen)
+        save_state(state)
         copied += 1
         logging.info(
             "Скопирован пост %s из %s в канал",

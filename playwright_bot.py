@@ -323,6 +323,28 @@ class VkPlaywrightBot:
             raise ValueError(f"Некорректная ссылка на сообщество: {url}")
         return url
 
+    def _expand_truncated_posts(self) -> None:
+        page = self.page
+        expand_patterns = [
+            'button:has-text("Читать далее")',
+            'button:has-text("Показать полностью")',
+            'a:has-text("Читать далее")',
+            'a:has-text("Показать полностью")',
+            '[class*="ShowMore"]',
+            '[class*="showMore"]',
+        ]
+        for pattern in expand_patterns:
+            buttons = page.locator(pattern)
+            for index in range(min(buttons.count(), 30)):
+                button = buttons.nth(index)
+                try:
+                    if not button.is_visible():
+                        continue
+                    button.click(timeout=2_000)
+                    time.sleep(0.4)
+                except PlaywrightError:
+                    continue
+
     def _open_community_wall(self, url: str) -> None:
         page = self.page
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
@@ -362,6 +384,9 @@ class VkPlaywrightBot:
         logging.info("Открываю стену сообщества: %s", url)
         self._open_community_wall(url)
 
+        self._open_community_wall(url)
+        self._expand_truncated_posts()
+
         raw_posts: list[dict[str, Any]] = self.page.evaluate(
             """(limit) => {
                 const result = [];
@@ -377,31 +402,55 @@ class VkPlaywrightBot:
                     '[class*="vkitText"]',
                 ];
 
+                const isPostPhoto = (img) => {
+                    if (!img) return false;
+                    if (img.closest('[class*="Avatar"], [class*="PostHeader"], .PostHeader, .reply')) {
+                        return false;
+                    }
+                    const w = img.naturalWidth || img.width || 0;
+                    const h = img.naturalHeight || img.height || 0;
+                    if (w > 0 && h > 0 && (w < 80 || h < 80)) return false;
+                    const src = img.currentSrc || img.src || '';
+                    if (!src || src.startsWith('data:') || src.includes('emoji')) return false;
+                    return true;
+                };
+
                 const pickText = (node) => {
                     for (const sel of textSelectors) {
                         const el = node.querySelector(sel);
                         if (el && el.innerText.trim()) return el.innerText.trim();
                     }
                     const copy = node.cloneNode(true);
-                    for (const junk of copy.querySelectorAll('button, [role="button"], time, img, video')) {
+                    for (const junk of copy.querySelectorAll(
+                        'button, [role="button"], time, img, video, [class*="ShowMore"]'
+                    )) {
                         junk.remove();
                     }
                     return (copy.innerText || '').trim();
                 };
 
+                const pickPhotos = (node) => {
+                    const photoUrls = [];
+                    if (!node) return photoUrls;
+                    const imgs = node.querySelectorAll(
+                        'a.page_post_thumb_wrap img, .MediaGrid img, .vkitPhotoAlbumPhoto__image, [class*="Photo"] img, img'
+                    );
+                    for (const img of imgs) {
+                        if (!isPostPhoto(img)) continue;
+                        const src = img.currentSrc || img.src || '';
+                        if (!photoUrls.includes(src)) photoUrls.push(src);
+                    }
+                    return photoUrls;
+                };
+
                 const pushPost = (postId, node) => {
                     if (!postId || seen.has(postId) || result.length >= limit) return;
                     seen.add(postId);
-                    const text = node ? pickText(node) : '';
-                    const photoUrls = [];
-                    if (node) {
-                        for (const img of node.querySelectorAll('img')) {
-                            const src = img.currentSrc || img.src || '';
-                            if (!src || src.startsWith('data:') || src.includes('emoji')) continue;
-                            if (!photoUrls.includes(src)) photoUrls.push(src);
-                        }
-                    }
-                    result.push({ post_id: postId, text, photo_urls: photoUrls });
+                    result.push({
+                        post_id: postId,
+                        text: node ? pickText(node) : '',
+                        photo_urls: pickPhotos(node),
+                    });
                 };
 
                 for (const node of document.querySelectorAll('[data-post-id], div[id^="post-"]')) {
@@ -558,19 +607,40 @@ class VkPlaywrightBot:
 
     def _type_message(self, text: str) -> None:
         page = self.page
-        if text:
-            page.keyboard.press("Control+A")
-            page.keyboard.press("Backspace")
-            page.keyboard.type(text, delay=15)
-        else:
-            page.keyboard.press("Control+A")
-            page.keyboard.press("Backspace")
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        if not text:
+            return
+
+        focused = page.locator(
+            '[contenteditable="true"]:focus, [role="textbox"]:focus'
+        ).first
+        try:
+            if focused.count() > 0:
+                focused.fill(text, timeout=5_000)
+                return
+        except PlaywrightError:
+            pass
+
+        page.keyboard.insert_text(text)
+
+    def _wait_attachments_ready(self) -> None:
+        time.sleep(2)
+        try:
+            self.page.wait_for_selector(
+                '[class*="attach"], [class*="Attachment"], [data-testid*="attach"]',
+                timeout=8_000,
+            )
+        except PlaywrightError:
+            time.sleep(1)
 
     def publish_to_channel(
         self,
         channel_url: str,
         text: str,
         photo_urls: list[str] | None = None,
+        *,
+        return_to_url: str | None = None,
     ) -> None:
         page = self.page
         photo_urls = photo_urls or []
@@ -593,38 +663,46 @@ class VkPlaywrightBot:
                     f"URL: {page.url}. Убедитесь, что аккаунт — админ канала."
                 )
 
+            logging.info("Вставляю текст (%s символов)", len(text))
             self._type_message(text)
+            time.sleep(1)
 
             if photo_urls:
+                logging.info("Прикрепляю фото: %s шт.", len(photo_urls))
                 temp_files = self._download_photos(photo_urls)
                 attach_selectors = [
                     '[data-testid="attach_photo"]',
                     'button[aria-label*="фото" i]',
                     'button[aria-label*="photo" i]',
-                    '.ComposerButton--attach',
+                    'button[aria-label*="Фото" i]',
+                    ".ComposerButton--attach",
+                    '[data-testid="attach"]',
                 ]
                 attached = False
                 for selector in attach_selectors:
                     button = page.locator(selector).first
                     if button.count() == 0 or not button.is_visible():
                         continue
-                    with page.expect_file_chooser(timeout=10_000) as chooser_info:
-                        button.click()
-                    chooser = chooser_info.value
-                    chooser.set_files([str(path) for path in temp_files])
-                    attached = True
-                    time.sleep(2)
-                    break
+                    try:
+                        with page.expect_file_chooser(timeout=10_000) as chooser_info:
+                            button.click()
+                        chooser = chooser_info.value
+                        chooser.set_files([str(path) for path in temp_files])
+                        attached = True
+                        self._wait_attachments_ready()
+                        break
+                    except PlaywrightError:
+                        continue
 
                 if not attached:
                     file_input = page.locator('input[type="file"]').first
                     if file_input.count() > 0:
                         file_input.set_input_files([str(path) for path in temp_files])
                         attached = True
-                        time.sleep(2)
+                        self._wait_attachments_ready()
 
                 if not attached:
-                    logging.warning("Не удалось прикрепить фото, отправляю только текст")
+                    raise RuntimeError("Не удалось прикрепить фото к сообщению")
 
             sent = self._click_first([
                 '[data-testid="send_button"]',
@@ -636,10 +714,14 @@ class VkPlaywrightBot:
                 ".ConvoComposer__sendButton",
             ])
             if not sent:
-                page.keyboard.press("Enter")
+                raise RuntimeError("Не найдена кнопка «Отправить»")
 
             time.sleep(2)
             logging.info("Сообщение отправлено в канал")
+
+            if return_to_url:
+                logging.info("Возвращаюсь к парсингу: %s", return_to_url)
+                self._open_community_wall(return_to_url)
         finally:
             for path in temp_files:
                 path.unlink(missing_ok=True)
