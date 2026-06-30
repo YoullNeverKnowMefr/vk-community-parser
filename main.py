@@ -145,8 +145,64 @@ def post_key(community_url: str, post: WallPost) -> str:
     return f"{community_url}::{normalize_post_id(post.post_id)}"
 
 
+def normalize_for_keyword_match(text: str) -> str:
+    return text.lower().replace("мах", "max")
+
+
 def post_contains_keyword(post: WallPost, keyword: str) -> bool:
-    return keyword.lower() in post.text.lower()
+    return normalize_for_keyword_match(keyword) in normalize_for_keyword_match(post.text)
+
+
+def split_paragraphs(text: str) -> list[str]:
+    normalized = text.replace("\r\n", "\n").strip()
+    if not normalized:
+        return []
+    if re.search(r"\n\s*\n", normalized):
+        return [part.strip() for part in re.split(r"\n\s*\n", normalized) if part.strip()]
+    return [line.strip() for line in normalized.split("\n") if line.strip()]
+
+
+def paragraph_contains_keyword(paragraph: str, keyword: str) -> bool:
+    paragraph_norm = normalize_for_keyword_match(paragraph)
+    keyword_norm = normalize_for_keyword_match(keyword)
+    if keyword_norm in paragraph_norm:
+        return True
+    return "мы теперь и в max" in paragraph_norm
+
+
+def remove_last_keyword_paragraph(text: str, keyword: str) -> str:
+    paragraphs = split_paragraphs(text)
+    if not paragraphs:
+        return text.strip()
+    for index in range(len(paragraphs) - 1, -1, -1):
+        if paragraph_contains_keyword(paragraphs[index], keyword):
+            removed = paragraphs.pop(index)
+            logging.info(
+                "Удалён абзац с ключевой фразой (%s симв.): %s",
+                len(removed),
+                removed.replace("\n", " ")[:120],
+            )
+            break
+    return "\n\n".join(paragraphs).strip()
+
+
+def resolve_channel_signature(config: dict[str, Any], channel_url: str) -> str:
+    signatures = config.get("channel_signatures")
+    if isinstance(signatures, dict):
+        for key, value in signatures.items():
+            if str(key).strip() == channel_url.strip():
+                return str(value).strip()
+    return str(config.get("channel_signature", "")).strip()
+
+
+def prepare_post_text(text: str, keyword: str, signature: str) -> str:
+    body = remove_last_keyword_paragraph(text, keyword)
+    signature = signature.strip()
+    if not signature:
+        return body
+    if not body:
+        return signature
+    return f"{body}\n\n{signature}"
 
 
 def post_text_may_be_truncated(text: str) -> bool:
@@ -215,6 +271,7 @@ def process_community(
     posts_per_check: int,
     state: dict[str, Any],
     max_post_age_seconds: int,
+    channel_signature: str,
 ) -> int:
     copied = 0
     seen = processed_set(state)
@@ -277,10 +334,18 @@ def process_community(
             keyword,
         )
 
+        publish_text = prepare_post_text(post.text, keyword, channel_signature)
+        if not publish_text.strip():
+            logging.warning(
+                "Пост %s: после обработки текста не осталось содержимого",
+                post.post_id,
+            )
+            continue
+
         try:
             bot.publish_to_channel(
                 target_channel_url,
-                post.text,
+                publish_text,
                 post.photo_urls,
                 return_to_url=community_url,
             )
@@ -313,6 +378,7 @@ def run_once(bot: VkPlaywrightBot, config: dict[str, Any], state: dict[str, Any]
     max_post_age_seconds = int(config.get("max_post_age_seconds", 3600))
     source_urls = config.get("source_community_urls", [])
     target_channel_url = config.get("target_channel_url", DEFAULT_TARGET_CHANNEL_URL)
+    channel_signature = resolve_channel_signature(config, target_channel_url)
 
     if not source_urls:
         raise ValueError("В config.json укажите source_community_urls")
@@ -331,6 +397,7 @@ def run_once(bot: VkPlaywrightBot, config: dict[str, Any], state: dict[str, Any]
             posts_per_check,
             state,
             max_post_age_seconds,
+            channel_signature,
         )
 
     save_state(state)
